@@ -641,15 +641,18 @@ class ClassMappingClassify(nn.Module):
 
     def forward(self, src: torch.Tensor, class_vector: torch.Tensor):
         b, c, h, w, d = src.shape
-        src = self.image_post_mapping(src)
-        class_embedding = self.class_embeddings(class_vector)
-        if self.use_mlp:
-            class_embedding = self.mlp(class_embedding)
-        # [b,1,feat] @ [1,feat,dim], batch dimension become class_embedding batch dimension.
-        masks = []
-        for i in range(b):
-            mask = class_embedding @ src[[i]].view(1, c, h * w * d)
-            masks.append(mask.view(-1, 1, h, w, d))
+        with Range("VISTA3D_Header_PostRange"):
+            src = self.image_post_mapping(src)
+        with Range("VISTA3D_Header_Class_Embedding"):
+            class_embedding = self.class_embeddings(class_vector)
+            if self.use_mlp:
+                class_embedding = self.mlp(class_embedding)
+            # [b,1,feat] @ [1,feat,dim], batch dimension become class_embedding batch dimension.
+        with Range("VISTA3D_Header_Embedding_Mask"):
+            masks = []
+            for i in range(b):
+                mask = class_embedding @ src[[i]].view(1, c, h * w * d)
+                masks.append(mask.view(-1, 1, h, w, d))
 
         return torch.cat(masks, 1), class_embedding
 

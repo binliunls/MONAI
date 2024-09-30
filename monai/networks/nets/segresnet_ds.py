@@ -22,7 +22,7 @@ import torch.nn as nn
 from monai.networks.blocks.upsample import UpSample
 from monai.networks.layers.factories import Act, Conv, Norm, split_args
 from monai.networks.layers.utils import get_act_layer, get_norm_layer
-from monai.utils import UpsampleMode, has_option
+from monai.utils import Range, UpsampleMode, has_option
 
 __all__ = ["SegResNetDS", "SegResNetDS2"]
 
@@ -498,42 +498,47 @@ class SegResNetDS2(SegResNetDS):
         if not self.is_valid_shape(x):
             raise ValueError(f"Input spatial dims {x.shape} must be divisible by {self.shape_factor()}")
 
-        x_down = self.encoder(x)
+        with Range("SegResNet_Encoder"):
+            x_down = self.encoder(x)
 
-        x_down.reverse()
-        x = x_down.pop(0)
+        with Range("SegResNet_Upsampling"):
+            x_down.reverse()
+            x = x_down.pop(0)
 
-        if len(x_down) == 0:
-            x_down = [torch.zeros(1, device=x.device, dtype=x.dtype)]
+            if len(x_down) == 0:
+                x_down = [torch.zeros(1, device=x.device, dtype=x.dtype)]
 
-        outputs: list[torch.Tensor] = []
-        outputs_auto: list[torch.Tensor] = []
-        x_ = x.clone()
-        if with_point:
-            i = 0
-            for level in self.up_layers:
-                x = level["upsample"](x)
-                x = x + x_down[i]
-                x = level["blocks"](x)
+            outputs: list[torch.Tensor] = []
+            outputs_auto: list[torch.Tensor] = []
+            x_ = x
+            if with_point:
+                if with_label:
+                    x_ = x.clone()
+                i = 0
+                for level in self.up_layers:
+                    x = level["upsample"](x)
+                    x = x + x_down[i]
+                    x = level["blocks"](x)
 
-                if len(self.up_layers) - i <= self.dsdepth:
-                    outputs.append(level["head"](x))
-                i = i + 1
+                    if len(self.up_layers) - i <= self.dsdepth:
+                        outputs.append(level["head"](x))
+                    i = i + 1
 
-            outputs.reverse()
-        x = x_
-        if with_label:
-            i = 0
-            for level in self.up_layers_auto:
-                x = level["upsample"](x)
-                x = x + x_down[i]
-                x = level["blocks"](x)
+                outputs.reverse()
 
-                if len(self.up_layers) - i <= self.dsdepth:
-                    outputs_auto.append(level["head"](x))
-                i = i + 1
+            x = x_
+            if with_label:
+                i = 0
+                for level in self.up_layers_auto:
+                    x = level["upsample"](x)
+                    x = x + x_down[i]
+                    x = level["blocks"](x)
 
-            outputs_auto.reverse()
+                    if len(self.up_layers) - i <= self.dsdepth:
+                        outputs_auto.append(level["head"](x))
+                    i = i + 1
+
+                outputs_auto.reverse()
 
         return outputs[0] if len(outputs) == 1 else outputs, outputs_auto[0] if len(outputs_auto) == 1 else outputs_auto
 

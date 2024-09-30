@@ -25,7 +25,7 @@ from monai.networks.nets import SegResNetDS2
 from monai.transforms.utils import convert_points_to_disc
 from monai.transforms.utils import keep_merge_components_with_points as lcc
 from monai.transforms.utils import sample_points_from_label
-from monai.utils import optional_import, unsqueeze_left, unsqueeze_right
+from monai.utils import Range, optional_import, unsqueeze_left, unsqueeze_right
 
 rearrange, _ = optional_import("einops", name="rearrange")
 
@@ -383,92 +383,99 @@ class VISTA3D(nn.Module):
             transpose: bool. If true, the output will be transposed to be [1, B, H, W, D]. Required to be true if calling from
                 sliding window inferer/point inferer.
         """
-        labels, prev_mask, point_coords = self.update_slidingwindow_padding(
-            kwargs.get("pad_size", None), labels, prev_mask, point_coords
-        )
-        image_size = input_images.shape[-3:]
-        device = input_images.device
-        if point_coords is None and class_vector is None:
-            return self.NINF_VALUE + torch.zeros([1, 1, *image_size], device=device)
+        with Range("VISTA3D_Forward_Preprocessing"):
+            labels, prev_mask, point_coords = self.update_slidingwindow_padding(
+                kwargs.get("pad_size", None), labels, prev_mask, point_coords
+            )
+            image_size = input_images.shape[-3:]
+            device = input_images.device
+            if point_coords is None and class_vector is None:
+                return self.NINF_VALUE + torch.zeros([1, 1, *image_size], device=device)
 
-        bs = self.get_foreground_class_count(class_vector, point_coords)
-        if patch_coords is not None:
-            # if during validation and perform enable based point-validation.
-            if labels is not None and label_set is not None:
-                # if labels is not None, sample from labels for each patch.
-                if val_point_sampler is None:
-                    # TODO: think about how to refactor this part.
-                    val_point_sampler = self.sample_points_patch_val
-                point_coords, point_labels, prompt_class = val_point_sampler(labels, patch_coords[0], label_set)
-                if prompt_class[0].item() == 0:  # type: ignore
-                    point_labels[0] = -1  # type: ignore
-                labels, prev_mask = None, None
-            elif point_coords is not None:
-                # If not performing patch-based point only validation, use user provided click points for inference.
-                # the point clicks is in original image space, convert it to current patch-coordinate space.
-                point_coords, point_labels = self.update_point_to_patch(patch_coords[0], point_coords, point_labels)  # type: ignore
+            bs = self.get_foreground_class_count(class_vector, point_coords)
+            if patch_coords is not None:
+                # if during validation and perform enable based point-validation.
+                if labels is not None and label_set is not None:
+                    # if labels is not None, sample from labels for each patch.
+                    if val_point_sampler is None:
+                        # TODO: think about how to refactor this part.
+                        val_point_sampler = self.sample_points_patch_val
+                    point_coords, point_labels, prompt_class = val_point_sampler(labels, patch_coords[0], label_set)
+                    if prompt_class[0].item() == 0:  # type: ignore
+                        point_labels[0] = -1  # type: ignore
+                    labels, prev_mask = None, None
+                elif point_coords is not None:
+                    # If not performing patch-based point only validation, use user provided click points for inference.
+                    # the point clicks is in original image space, convert it to current patch-coordinate space.
+                    point_coords, point_labels = self.update_point_to_patch(patch_coords[0], point_coords, point_labels)  # type: ignore
 
-        if point_coords is not None and point_labels is not None:
-            # remove points that used for padding purposes (point_label = -1)
-            mapping_index = ((point_labels != -1).sum(1) > 0).to(torch.bool)
-            if mapping_index.any():
-                point_coords = point_coords[mapping_index]
-                point_labels = point_labels[mapping_index]
-                if prompt_class is not None:
-                    prompt_class = prompt_class[mapping_index]
-            else:
-                if self.auto_freeze or (class_vector is None and patch_coords is None):
-                    # if auto_freeze, point prompt must exist to allow loss backward
-                    # in training, class_vector and point cannot both be None due to loss.backward()
-                    mapping_index.fill_(True)
+            if point_coords is not None and point_labels is not None:
+                # remove points that used for padding purposes (point_label = -1)
+                mapping_index = ((point_labels != -1).sum(1) > 0).to(torch.bool)
+                if mapping_index.any():
+                    point_coords = point_coords[mapping_index]
+                    point_labels = point_labels[mapping_index]
+                    if prompt_class is not None:
+                        prompt_class = prompt_class[mapping_index]
                 else:
-                    point_coords, point_labels = None, None
+                    if self.auto_freeze or (class_vector is None and patch_coords is None):
+                        # if auto_freeze, point prompt must exist to allow loss backward
+                        # in training, class_vector and point cannot both be None due to loss.backward()
+                        mapping_index.fill_(True)
+                    else:
+                        point_coords, point_labels = None, None
 
-        if point_coords is None and class_vector is None:
-            logits = self.NINF_VALUE + torch.zeros([bs, 1, *image_size], device=device)
+            if point_coords is None and class_vector is None:
+                logits = self.NINF_VALUE + torch.zeros([bs, 1, *image_size], device=device)
+                if transpose:
+                    logits = logits.transpose(1, 0)
+                return logits
+
+        with Range("VISTA3D_Forward_Encoder"):
+            if self.image_embeddings is not None and kwargs.get("keep_cache", False) and class_vector is None:
+                out, out_auto = self.image_embeddings, None
+            else:
+                out, out_auto = self.image_encoder(
+                    input_images, with_point=point_coords is not None, with_label=class_vector is not None
+                )
+        
+        with Range("VISTA3D_Forward_Headers"):
+            # release memory
+            input_images = None  # type: ignore
+
+            # force releasing memories that set to None
+            torch.cuda.empty_cache()
+            if class_vector is not None:
+                with Range("VISTA3D_Forward_Cls_Header"):
+                    logits, _ = self.class_head(out_auto, class_vector)
+                if point_coords is not None:
+                    with Range("VISTA3D_Forward_Point_Header"):
+                        point_logits = self.point_head(out, point_coords, point_labels, class_vector=prompt_class)
+                        if patch_coords is None:
+                            logits = self.gaussian_combine(
+                                logits, point_logits, point_coords, point_labels, mapping_index, radius  # type: ignore
+                            )
+                        else:
+                            # during validation use largest component
+                            logits = self.connected_components_combine(
+                                logits, point_logits, point_coords, point_labels, mapping_index  # type: ignore
+                            )
+            else:
+                with Range("VISTA3D_Forward_Point_Header"):
+                    logits = self.NINF_VALUE + torch.zeros([bs, 1, *image_size], device=device, dtype=out.dtype)
+                    logits[mapping_index] = self.point_head(out, point_coords, point_labels, class_vector=prompt_class)
+                    if prev_mask is not None and patch_coords is not None:
+                        logits = self.connected_components_combine(
+                            prev_mask[patch_coords[0]].transpose(1, 0).to(logits.device),
+                            logits[mapping_index],
+                            point_coords,  # type: ignore
+                            point_labels,  # type: ignore
+                            mapping_index,
+                        )
+            if kwargs.get("keep_cache", False) and class_vector is None:
+                self.image_embeddings = out.detach()
             if transpose:
                 logits = logits.transpose(1, 0)
-            return logits
-
-        if self.image_embeddings is not None and kwargs.get("keep_cache", False) and class_vector is None:
-            out, out_auto = self.image_embeddings, None
-        else:
-            out, out_auto = self.image_encoder(
-                input_images, with_point=point_coords is not None, with_label=class_vector is not None
-            )
-        # release memory
-        input_images = None  # type: ignore
-
-        # force releasing memories that set to None
-        torch.cuda.empty_cache()
-        if class_vector is not None:
-            logits, _ = self.class_head(out_auto, class_vector)
-            if point_coords is not None:
-                point_logits = self.point_head(out, point_coords, point_labels, class_vector=prompt_class)
-                if patch_coords is None:
-                    logits = self.gaussian_combine(
-                        logits, point_logits, point_coords, point_labels, mapping_index, radius  # type: ignore
-                    )
-                else:
-                    # during validation use largest component
-                    logits = self.connected_components_combine(
-                        logits, point_logits, point_coords, point_labels, mapping_index  # type: ignore
-                    )
-        else:
-            logits = self.NINF_VALUE + torch.zeros([bs, 1, *image_size], device=device, dtype=out.dtype)
-            logits[mapping_index] = self.point_head(out, point_coords, point_labels, class_vector=prompt_class)
-            if prev_mask is not None and patch_coords is not None:
-                logits = self.connected_components_combine(
-                    prev_mask[patch_coords[0]].transpose(1, 0).to(logits.device),
-                    logits[mapping_index],
-                    point_coords,  # type: ignore
-                    point_labels,  # type: ignore
-                    mapping_index,
-                )
-        if kwargs.get("keep_cache", False) and class_vector is None:
-            self.image_embeddings = out.detach()
-        if transpose:
-            logits = logits.transpose(1, 0)
         return logits
 
 
@@ -634,17 +641,18 @@ class ClassMappingClassify(nn.Module):
 
     def forward(self, src: torch.Tensor, class_vector: torch.Tensor):
         b, c, h, w, d = src.shape
-        src = self.image_post_mapping(src)
-        class_embedding = self.class_embeddings(class_vector)
-        if self.use_mlp:
-            class_embedding = self.mlp(class_embedding)
-        # [b,1,feat] @ [1,feat,dim], batch dimension become class_embedding batch dimension.
-        masks = []
-        for i in range(b):
-            mask = class_embedding @ src[[i]].view(1, c, h * w * d)
-            masks.append(mask.view(-1, 1, h, w, d))
+        with Range("VISTA3D_Header_PostRange"):
+            src = self.image_post_mapping(src)
+        with Range("VISTA3D_Header_Class_Embedding"):
+            class_embedding = self.class_embeddings(class_vector)
+            if self.use_mlp:
+                class_embedding = self.mlp(class_embedding)
+            # [b,1,feat] @ [1,feat,dim], batch dimension become class_embedding batch dimension.
+        with Range("VISTA3D_Header_Embedding_Mask"):
+            masks_embedding = class_embedding.squeeze() @ src.view(b, c, h * w * d)
+            masks_embedding = masks_embedding.view(b, -1, h, w, d).transpose(0, 1)
 
-        return torch.cat(masks, 1), class_embedding
+        return masks_embedding, class_embedding
 
 
 class TwoWayTransformer(nn.Module):
